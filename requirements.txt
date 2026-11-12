@@ -1,0 +1,7 @@
+   streamlit
+   anthropic
+   python-dotenv
+   pillow
+   pillow-heif
+   pandas
+   fpdf2
