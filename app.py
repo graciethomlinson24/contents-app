@@ -2,17 +2,17 @@
 # The main file for the Home Contents Scanner app.
 
 import hashlib
-import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
+import storage
 from ai_scanner import scan_room, friendly_error
 from auth import current_user, show_login_page, logout
 from export import make_csv, make_pdf
 from image_utils import prepare_image, has_metadata
 from inventory import (
-    COLUMNS,
     MONEY,
     items_to_table,
     clean_table,
@@ -20,8 +20,7 @@ from inventory import (
     combine_rooms,
 )
 
-# Most scans one visitor can do in one session (protects your API bill)
-MAX_SCANS = 20
+NZ_TIME = ZoneInfo("Pacific/Auckland")
 
 # Page settings: browser tab title, icon and layout
 st.set_page_config(
@@ -35,15 +34,37 @@ if not current_user():
     show_login_page()
     st.stop()  # stop here: don't show the rest of the app
 
-# --- Memory setup (runs once per visit) ---
+# --- Load this user's saved rooms (once per login) ---
 if "house" not in st.session_state:
-    st.session_state.house = []  # the list of saved rooms
+    with st.spinner("Loading your saved rooms..."):
+        try:
+            st.session_state.house = storage.load_rooms()
+            st.session_state.scans_used = storage.count_recent_scans()
+        except Exception as e:
+            print(f"[load error] {e!r}")
+            st.error("Couldn't load your saved rooms. Please log out and log back in.")
+            if st.button("Log out"):
+                logout()
+            st.stop()
+
 if "form_id" not in st.session_state:
     st.session_state.form_id = 0  # goes up after each saved room, which clears the upload form
-if "scans_used" not in st.session_state:
-    st.session_state.scans_used = 0  # how many AI scans this visitor has done
 
 form_id = st.session_state.form_id
+house = st.session_state.house
+
+
+def nice_date(iso_text):
+    """Turn '2026-11-13T03:56:12+00:00' into '13 Nov 2026' in NZ time."""
+    try:
+        return datetime.fromisoformat(iso_text).astimezone(NZ_TIME).strftime("%d %b %Y")
+    except Exception:
+        return ""
+
+
+def total_of(items_json):
+    return sum((i.get("Qty") or 0) * (i.get("Value each (NZD)") or 0) for i in items_json)
+
 
 # --- Header ---
 st.title("🏠 Home Contents Scanner")
@@ -55,11 +76,27 @@ st.warning(
     "Always check them yourself and confirm with your insurer before relying on them."
 )
 
-# --- Sidebar: how it works + privacy note ---
+# --- Sidebar ---
 with st.sidebar:
     st.write(f"👤 Logged in as **{current_user()['email']}**")
     if st.button("Log out"):
         logout()
+    st.divider()
+
+    # The "side log": every saved room, newest at the bottom
+    st.header("📸 Scan history")
+    if not house:
+        st.caption("Rooms you save will appear here.")
+    for room in house:
+        thumb, text = st.columns([1, 2])
+        if room["photo"]:
+            thumb.image(room["photo"], width=70)
+        text.markdown(
+            f"**{room['room']}**  \n{nice_date(room['created_at'])} · ${total_of(room['saved_json']):,.0f}"
+        )
+    st.caption(
+        f"AI scans used in the last 30 days: {st.session_state.scans_used} of {storage.MAX_SCANS_PER_30_DAYS}"
+    )
     st.divider()
 
     st.header("How it works")
@@ -72,12 +109,6 @@ with st.sidebar:
 5. Export your list as PDF or CSV
 """
     )
-    st.metric("Rooms saved", len(st.session_state.house))
-    st.caption(
-        "⚠️ Your list only lives in this browser tab. "
-        "Refreshing or closing the page clears it, so export before you leave."
-    )
-    st.divider()
 
     with st.expander("🔒 Privacy: how your photos are used"):
         st.markdown(
@@ -85,11 +116,15 @@ with st.sidebar:
 **What happens to your photo**
 1. This app removes hidden location (GPS) data and shrinks the photo.
 2. The photo is sent to **Anthropic**, the company behind the Claude AI, so it can identify the items.
-3. The item list comes back to this page.
+3. When you save a room, the photo and item list are stored **in your account**
+   (on secure servers in Sydney, Australia).
 
-**What we keep:** nothing. Photos and lists only live in this browser tab and
-disappear when you close or refresh it. Anthropic says it doesn't use API data to train
-its models by default. See Anthropic's privacy policy for how long it keeps data.
+**Who can see it:** only you. Each account can only access its own rooms and photos.
+Anthropic says it doesn't use API data to train its models by default.
+See Anthropic's privacy policy for how long it keeps data.
+
+**Deleting:** you can delete any room, or your whole account and everything in it,
+at any time from this sidebar.
 
 **Tips for safer photos**
 - Avoid capturing people, documents, letters with your address, ID cards or open laptop screens.
@@ -98,16 +133,42 @@ its models by default. See Anthropic's privacy policy for how long it keeps data
 """
         )
 
-    if st.session_state.house:
-        with st.expander("🗑️ Start over"):
-            st.write("This removes every saved room. Download your export first if you want to keep it.")
-            if st.button("Yes, clear all rooms"):
+    if house:
+        with st.expander("🗑️ Delete all my rooms"):
+            st.write("This permanently deletes every saved room and photo. Download your export first if you want to keep it.")
+            if st.button("Yes, delete all my rooms"):
+                failed = False
+                for room in house:
+                    try:
+                        storage.delete_room(room)
+                    except Exception as e:
+                        print(f"[delete error] {e!r}")
+                        failed = True
                 st.session_state.house = []
+                if failed:
+                    st.error("Some rooms couldn't be deleted. Please try again.")
                 st.rerun()
+
+    with st.expander("⚠️ Delete my account"):
+        st.write(
+            "This permanently deletes your account, all your rooms and all your photos. "
+            "It can't be undone."
+        )
+        confirm = st.text_input("Type DELETE to confirm")
+        if st.button("Delete my account", disabled=confirm != "DELETE"):
+            deleted = False
+            try:
+                storage.delete_account(house)
+                deleted = True
+            except Exception as e:
+                print(f"[account delete error] {e!r}")
+                st.error("Couldn't delete your account. Please try again.")
+            if deleted:
+                logout()
 
 # --- Message after a room is saved ---
 if st.session_state.get("just_saved"):
-    st.success(f"✅ {st.session_state.just_saved} saved! Add your next room below.")
+    st.success(f"✅ {st.session_state.just_saved} saved to your account! Add your next room below.")
     st.session_state.just_saved = None
 
 # --- Step 1: Add a room photo ---
@@ -159,13 +220,17 @@ if photo is not None:
     st.subheader("2. Scan with AI")
 
     agreed = st.checkbox(
-        "I understand this photo will be sent to Anthropic's AI service to identify the items in it.",
+        "I understand this photo will be sent to Anthropic's AI service to identify the items in it, "
+        "and saved to my account if I save the room.",
         key="consent",
     )
 
-    scans_left = MAX_SCANS - st.session_state.scans_used
+    scans_left = storage.MAX_SCANS_PER_30_DAYS - st.session_state.scans_used
     if scans_left <= 0:
-        st.error(f"You've reached the limit of {MAX_SCANS} scans for this session. You can still edit and add items by hand.")
+        st.error(
+            f"You've used all {storage.MAX_SCANS_PER_30_DAYS} AI scans for the last 30 days. "
+            "You can still add and edit items by hand."
+        )
 
     if st.button("🔍 Scan this room", type="primary", disabled=not agreed or scans_left <= 0):
         with st.spinner("Scanning... this usually takes 10–30 seconds"):
@@ -177,13 +242,20 @@ if photo is not None:
                 # Count scans so each new scan gets a fresh editable table
                 st.session_state.scan_count = st.session_state.get("scan_count", 0) + 1
             except Exception as e:
-                print(f"[scan error] {e!r}")  # full details go to the Terminal, for you
-                st.error(f"😕 {friendly_error(e)}")  # a friendly version goes to the user
+                print(f"[scan error] {e!r}")
+                st.error(f"😕 {friendly_error(e)}")
+
+        # Record the scan in the user's scan log (separately, so a logging hiccup doesn't lose the scan)
+        if st.session_state.get("scan_result"):
+            try:
+                storage.record_scan(st.session_state.scan_result["cost_usd"])
+            except Exception as e:
+                print(f"[scan log error] {e!r}")
 
     if not agreed:
         st.caption("Tick the box above to enable scanning.")
     elif 0 < scans_left <= 5:
-        st.caption(f"{scans_left} scans left this session.")
+        st.caption(f"{scans_left} AI scans left in the last 30 days.")
 
     # --- Step 3: Check and fix the list ---
     result = st.session_state.get("scan_result")
@@ -228,7 +300,7 @@ if photo is not None:
 
         # --- Step 4: Save this room ---
         st.subheader("4. Save this room")
-        if st.button("✅ Add this room to my house list", type="primary"):
+        if st.button("✅ Save this room to my account", type="primary"):
             # Tidy the room name: remove extra spaces and capitalise the first letter
             room_name = room_name.strip()
             room_name = room_name[:1].upper() + room_name[1:]
@@ -238,38 +310,41 @@ if photo is not None:
             elif final.empty:
                 st.error("There are no items to save. Add some items first.")
             else:
-                st.session_state.house.append(
-                    {
-                        "id": uuid.uuid4().hex,  # a unique ID for this room
-                        "room": room_name.strip(),
-                        "photo": jpeg_bytes,
-                        "items": final[COLUMNS].reset_index(drop=True),
-                    }
-                )
-                # Reset everything for the next room
-                st.session_state.form_id += 1
-                st.session_state.photo_id = None
-                st.session_state.scan_result = None
-                st.session_state.items_table = None
-                st.session_state.just_saved = room_name.strip()
-                st.rerun()
+                saved_room = None
+                with st.spinner("Saving to your account..."):
+                    try:
+                        saved_room = storage.save_room(room_name, jpeg_bytes, final)
+                    except Exception as e:
+                        print(f"[save error] {e!r}")
+                        st.error("Couldn't save this room. Please try again.")
+                if saved_room:
+                    house.append(saved_room)
+                    # Reset everything for the next room
+                    st.session_state.form_id += 1
+                    st.session_state.photo_id = None
+                    st.session_state.scan_result = None
+                    st.session_state.items_table = None
+                    st.session_state.just_saved = room_name
+                    st.rerun()
 
 # --- The whole house ---
 st.divider()
 st.header("🏡 Your whole house")
 
-house = st.session_state.house
-
 if not house:
-    st.info("No rooms saved yet. Scan a room and click 'Add this room to my house list' to start.")
+    st.info("No rooms saved yet. Scan a room and click 'Save this room to my account' to start.")
 else:
-    # Show each saved room. You can still edit it or remove it.
     edited_rooms = []   # (room name, cleaned table) pairs for the combined table
     export_rooms = []   # room name + photo + cleaned table, for the PDF
+    room_to_delete = None
+
     for room in house:
-        with st.expander(f"🚪 {room['room']}"):
+        with st.expander(f"🚪 {room['room']}  ·  saved {nice_date(room['created_at'])}"):
             left, right = st.columns([1, 2])
-            left.image(room["photo"], width=250)
+            if room["photo"]:
+                left.image(room["photo"], width=250)
+            else:
+                left.caption("Photo unavailable")
             with right:
                 room_edited = st.data_editor(
                     room["items"],
@@ -278,16 +353,36 @@ else:
                     hide_index=True,
                     column_config=editor_column_config(),
                 )
-                if st.button("🗑️ Remove this room", key=f"remove_{room['id']}"):
-                    st.session_state.house = [r for r in house if r["id"] != room["id"]]
-                    st.rerun()
+                if st.button("🗑️ Delete this room", key=f"remove_{room['id']}"):
+                    room_to_delete = room
+
         cleaned = clean_table(room_edited)
+
+        # Auto-save: if the table now differs from what's saved, save the new version
+        new_json = storage.df_to_json(cleaned)
+        if new_json != room["saved_json"]:
+            try:
+                storage.update_room_items(room["id"], new_json)
+                room["saved_json"] = new_json
+                st.toast(f"💾 Saved changes to {room['room']}")
+            except Exception as e:
+                print(f"[update error] {e!r}")
+                st.warning(f"Couldn't save your latest changes to {room['room']}. Please try again.")
+
         edited_rooms.append((room["room"], cleaned))
         export_rooms.append({"room": room["room"], "photo": room["photo"], "items": cleaned})
 
+    if room_to_delete:
+        try:
+            storage.delete_room(room_to_delete)
+            st.session_state.house = [r for r in house if r["id"] != room_to_delete["id"]]
+        except Exception as e:
+            print(f"[delete error] {e!r}")
+            st.error("Couldn't delete that room. Please try again.")
+        st.rerun()
+
     # Combine every room into one big table
     all_items = combine_rooms(edited_rooms)
-    st.session_state.all_items = all_items  # kept for the export stage
 
     # Headline numbers
     c1, c2, c3 = st.columns(3)
@@ -329,13 +424,13 @@ else:
     st.divider()
     st.header("📤 Export for your insurer")
     st.write(
-        "Download your list to keep it or send it to your insurer. "
+        "Download your list to send to your insurer. "
         "**The PDF** includes each room's photo. **The CSV** opens in Excel or Google Sheets."
     )
 
     owner_name = st.text_input("Name to show on the PDF (optional)", placeholder="e.g. Gracie Smith")
 
-    today = f"{datetime.now():%Y-%m-%d}"
+    today = f"{datetime.now(NZ_TIME):%Y-%m-%d}"
     col_csv, col_pdf = st.columns(2)
 
     col_csv.download_button(
@@ -358,6 +453,5 @@ else:
         col_pdf.error(f"Couldn't make the PDF: {e}")
 
     st.caption(
-        "🔒 Your files are created in your browser session and aren't stored by this app. "
-        "Keep them somewhere safe: they list valuable things in your home."
+        "🔒 Keep your exported files somewhere safe: they list valuable things in your home."
     )
