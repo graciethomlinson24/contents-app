@@ -131,7 +131,11 @@ def make_pdf(rooms, owner_name=""):
     for r in rooms:
         pdf.add_page()
         heading(pdf, r["room"], size=16)
-        add_photo(pdf, r["photo"])
+        if r["photo"]:
+            add_photo(pdf, r["photo"])
+        else:
+            pdf.cell(0, 6, "(Photo unavailable)", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
 
         items = r["items"]
         if items.empty:
