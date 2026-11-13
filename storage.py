@@ -13,9 +13,6 @@ from inventory import COLUMNS
 
 BUCKET = "room-photos"
 
-# Most AI scans one account can do in any 30 days (protects your API bill)
-MAX_SCANS_PER_30_DAYS = 30
-
 
 def df_to_json(df):
     """Turn a table into plain JSON-friendly data (lists of dictionaries)."""
@@ -114,4 +111,3 @@ def count_recent_scans():
 
 def record_scan(cost_usd):
     get_client().table("scans").insert({"user_id": current_user()["id"], "cost_usd": cost_usd}).execute()
-    
