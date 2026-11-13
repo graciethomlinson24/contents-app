@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
+import payments
 import storage
 from ai_scanner import scan_room, friendly_error
 from auth import current_user, show_login_page, logout
@@ -47,11 +48,58 @@ if "house" not in st.session_state:
                 logout()
             st.stop()
 
+if "paid" not in st.session_state:
+    try:
+        st.session_state.paid = payments.has_paid(current_user())
+    except Exception as e:
+        print(f"[payment check error] {e!r}")
+        st.session_state.paid = False
+
+# --- Coming back from Stripe after paying ---
+returned_session = st.query_params.get("checkout_session")
+if returned_session:
+    try:
+        if payments.verify_checkout(returned_session, current_user()):
+            st.session_state.paid = True
+            st.session_state.just_paid = True
+    except Exception as e:
+        print(f"[checkout verify error] {e!r}")
+    st.query_params.clear()  # tidy the web address
+
 if "form_id" not in st.session_state:
     st.session_state.form_id = 0  # goes up after each saved room, which clears the upload form
 
 form_id = st.session_state.form_id
 house = st.session_state.house
+paid = st.session_state.paid
+scan_limit = payments.PAID_SCANS if paid else payments.FREE_SCANS
+
+
+def show_upgrade_box():
+    """The 'unlock' offer, with a button that takes them to Stripe's secure payment page."""
+    st.info(
+        f"**Unlock your full house: {payments.PRICE_TEXT} one-off**  \n"
+        f"✓ Unlimited rooms  ✓ PDF & CSV export for your insurer  "
+        f"✓ {payments.PAID_SCANS} AI scans a month  ✓ 12 months of access"
+    )
+    if st.button(f"💳 Unlock for {payments.PRICE_TEXT}", type="primary"):
+        try:
+            st.session_state.checkout_url = payments.create_checkout_url(current_user())
+        except Exception as e:
+            print(f"[checkout error] {e!r}")
+            st.error("Couldn't start the payment. Please try again in a moment.")
+    if st.session_state.get("checkout_url"):
+        st.link_button("Continue to secure payment (Stripe) →", st.session_state.checkout_url)
+        st.caption("Opens in a new tab. Card details go straight to Stripe, never to this app.")
+    if st.button("I've paid: refresh my account"):
+        try:
+            st.session_state.paid = payments.has_paid(current_user())
+        except Exception as e:
+            print(f"[payment check error] {e!r}")
+        if not st.session_state.paid:
+            st.warning("We can't see a payment yet. It can take a minute to show up, so try again shortly.")
+        else:
+            st.rerun()
 
 
 def nice_date(iso_text):
@@ -94,9 +142,16 @@ with st.sidebar:
         text.markdown(
             f"**{room['room']}**  \n{nice_date(room['created_at'])} · ${total_of(room['saved_json']):,.0f}"
         )
-    st.caption(
-        f"AI scans used in the last 30 days: {st.session_state.scans_used} of {storage.MAX_SCANS_PER_30_DAYS}"
-    )
+    st.caption(f"AI scans used in the last 30 days: {st.session_state.scans_used} of {scan_limit}")
+    st.divider()
+
+    if paid:
+        st.success("⭐ Full house unlocked")
+    else:
+        st.info(
+            f"Free plan: up to {payments.FREE_ROOMS} rooms, no export. "
+            f"Unlock everything for {payments.PRICE_TEXT} in the Export section."
+        )
     st.divider()
 
     st.header("How it works")
@@ -166,6 +221,12 @@ at any time from this sidebar.
             if deleted:
                 logout()
 
+# --- Message after paying ---
+if st.session_state.get("just_paid"):
+    st.balloons()
+    st.success("🎉 Payment received, thank you! Your full house is unlocked for 12 months.")
+    st.session_state.just_paid = False
+
 # --- Message after a room is saved ---
 if st.session_state.get("just_saved"):
     st.success(f"✅ {st.session_state.just_saved} saved to your account! Add your next room below.")
@@ -225,12 +286,12 @@ if photo is not None:
         key="consent",
     )
 
-    scans_left = storage.MAX_SCANS_PER_30_DAYS - st.session_state.scans_used
+    scans_left = scan_limit - st.session_state.scans_used
     if scans_left <= 0:
-        st.error(
-            f"You've used all {storage.MAX_SCANS_PER_30_DAYS} AI scans for the last 30 days. "
-            "You can still add and edit items by hand."
-        )
+        message = f"You've used all {scan_limit} AI scans for the last 30 days. You can still add and edit items by hand."
+        if not paid:
+            message += f" Unlock the full house for {payments.PAID_SCANS} scans a month."
+        st.error(message)
 
     if st.button("🔍 Scan this room", type="primary", disabled=not agreed or scans_left <= 0):
         with st.spinner("Scanning... this usually takes 10–30 seconds"):
@@ -305,7 +366,12 @@ if photo is not None:
             room_name = room_name.strip()
             room_name = room_name[:1].upper() + room_name[1:]
 
-            if not room_name:
+            if not paid and len(house) >= payments.FREE_ROOMS:
+                st.error(
+                    f"The free plan holds {payments.FREE_ROOMS} rooms. "
+                    f"Unlock the full house for {payments.PRICE_TEXT} in the Export section below to add more."
+                )
+            elif not room_name:
                 st.error("Please give this room a name first (in the box at the top).")
             elif final.empty:
                 st.error("There are no items to save. Add some items first.")
@@ -427,6 +493,10 @@ else:
         "Download your list to send to your insurer. "
         "**The PDF** includes each room's photo. **The CSV** opens in Excel or Google Sheets."
     )
+
+    if not paid:
+        show_upgrade_box()
+        st.stop()  # nothing below this point for free users
 
     owner_name = st.text_input("Name to show on the PDF (optional)", placeholder="e.g. Gracie Smith")
 
