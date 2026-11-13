@@ -6,3 +6,4 @@ pillow-heif
 pandas
 fpdf2
 supabase
+stripe
