@@ -1,7 +1,8 @@
-   streamlit
-   anthropic
-   python-dotenv
-   pillow
-   pillow-heif
-   pandas
-   fpdf2
+streamlit
+anthropic
+python-dotenv
+pillow
+pillow-heif
+pandas
+fpdf2
+supabase
