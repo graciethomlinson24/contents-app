@@ -2,13 +2,13 @@
 # The main file for the Home Contents Scanner app.
 
 import hashlib
-import hmac
 import uuid
 from datetime import datetime
 
 import streamlit as st
 
-from ai_scanner import scan_room, friendly_error, get_secret
+from ai_scanner import scan_room, friendly_error
+from auth import current_user, show_login_page, logout
 from export import make_csv, make_pdf
 from image_utils import prepare_image, has_metadata
 from inventory import (
@@ -30,28 +30,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- Password lock ---
-def check_password():
-    """Shows a password box. Returns True once the right password has been entered."""
-    correct_password = get_secret("APP_PASSWORD")
-    if not correct_password:
-        return True  # no password set (e.g. on your own Mac), so let everyone in
-    if st.session_state.get("unlocked"):
-        return True
-
-    st.title("🏠 Home Contents Scanner")
-    entered = st.text_input("Password", type="password")
-    if entered:
-        # compare_digest is a safer way to compare passwords than ==
-        if hmac.compare_digest(entered, correct_password):
-            st.session_state.unlocked = True
-            st.rerun()
-        else:
-            st.error("Wrong password. Please try again.")
-    return False
-
-
-if not check_password():
+# --- Accounts: show the login screen until someone is logged in ---
+if not current_user():
+    show_login_page()
     st.stop()  # stop here: don't show the rest of the app
 
 # --- Memory setup (runs once per visit) ---
@@ -76,6 +57,11 @@ st.warning(
 
 # --- Sidebar: how it works + privacy note ---
 with st.sidebar:
+    st.write(f"👤 Logged in as **{current_user()['email']}**")
+    if st.button("Log out"):
+        logout()
+    st.divider()
+
     st.header("How it works")
     st.markdown(
         """
